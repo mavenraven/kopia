@@ -10,6 +10,10 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/kopia/kopia/fs"
 	"github.com/kopia/kopia/internal/iocopy"
@@ -20,6 +24,8 @@ import (
 	"github.com/kopia/kopia/repo/logging"
 	"github.com/kopia/kopia/repo/object"
 )
+
+var verifierTracer = otel.Tracer("kopia/verifier")
 
 var verifierLog = logging.Module("verifier")
 
@@ -143,6 +149,12 @@ func (v *Verifier) showStatsJSON(ctx context.Context, st VerifierStats) {
 
 // VerifyFile verifies a single file object (using content check, blob map check or full read).
 func (v *Verifier) VerifyFile(ctx context.Context, oid object.ID, entryPath string, size int64) error {
+	ctx, span := verifierTracer.Start(ctx, "VerifyFile", oteltrace.WithAttributes(
+		attribute.String("oid", oid.String()),
+		attribute.Int64("size", size),
+	))
+	defer span.End()
+
 	verifierLog(ctx).Debugf("verifying object %v", oid)
 
 	defer func() {
@@ -155,6 +167,8 @@ func (v *Verifier) VerifyFile(ctx context.Context, oid object.ID, entryPath stri
 
 	contentIDs, err := v.rep.VerifyObject(ctx, oid)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return errors.Wrap(err, "verify object")
 	}
 
@@ -214,19 +228,30 @@ func (v *Verifier) verifyObject(ctx context.Context, e fs.Entry, oid object.ID, 
 }
 
 func (v *Verifier) readEntireObject(ctx context.Context, oid object.ID, path string) error {
+	ctx, span := verifierTracer.Start(ctx, "ReadEntireObject", oteltrace.WithAttributes(
+		attribute.String("oid", oid.String()),
+	))
+	defer span.End()
+
 	verifierLog(ctx).Debugf("reading object %v %v", oid, path)
 
 	// read the entire file
 	r, err := v.rep.OpenObject(ctx, oid)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return errors.Wrapf(err, "unable to open object %v", oid)
 	}
 	defer r.Close() //nolint:errcheck
 
 	n, err := iocopy.Copy(io.Discard, r)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return errors.Wrap(err, "unable to read data")
 	}
+
+	span.SetAttributes(attribute.Int64("bytes_read", n))
 
 	v.statsMu.Lock()
 	defer v.statsMu.Unlock()
@@ -262,6 +287,9 @@ type VerifierResult struct {
 // partial stats when an error is returned, including a collection of errors
 // found in the verification process.
 func (v *Verifier) InParallel(ctx context.Context, enqueue func(tw *TreeWalker) error) (VerifierResult, error) {
+	ctx, span := verifierTracer.Start(ctx, "InParallel")
+	defer span.End()
+
 	tw, twerr := NewTreeWalker(ctx, TreeWalkerOptions{
 		Parallelism:   v.opts.Parallelism,
 		EntryCallback: v.verifyObject,
@@ -303,6 +331,19 @@ func (v *Verifier) InParallel(ctx context.Context, enqueue func(tw *TreeWalker) 
 	errStrs := make([]string, 0, len(twErrs))
 	for _, twErr := range twErrs {
 		errStrs = append(errStrs, twErr.Error())
+	}
+
+	st := v.getStats()
+	span.SetAttributes(
+		attribute.Int64("processed_objects", st.ProcessedObjectCount),
+		attribute.Int64("processed_bytes", st.ProcessedBytes),
+		attribute.Int64("read_files", st.ReadFileCount),
+		attribute.Int64("read_bytes", st.ReadBytes),
+		attribute.Int("error_count", numErrors),
+	)
+
+	if numErrors > 0 {
+		span.SetStatus(codes.Error, "verification found errors")
 	}
 
 	// Return the tree walker error output along with result details.
