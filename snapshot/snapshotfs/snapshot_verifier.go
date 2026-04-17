@@ -187,9 +187,12 @@ func (v *Verifier) VerifyFile(ctx context.Context, oid object.ID, entryPath stri
 
 	//nolint:gosec
 	if 100*rand.Float64() < v.opts.VerifyFilesPercent {
-		if err := v.readEntireObject(ctx, oid, entryPath); err != nil {
+		n, err := v.readEntireObject(ctx, oid, entryPath)
+		if err != nil {
 			return errors.Wrapf(err, "error reading object %v", oid)
 		}
+
+		span.SetAttributes(attribute.Int64("bytes_read", n))
 	}
 
 	return nil
@@ -227,31 +230,20 @@ func (v *Verifier) verifyObject(ctx context.Context, e fs.Entry, oid object.ID, 
 	return nil
 }
 
-func (v *Verifier) readEntireObject(ctx context.Context, oid object.ID, path string) error {
-	ctx, span := verifierTracer.Start(ctx, "ReadEntireObject", oteltrace.WithAttributes(
-		attribute.String("oid", oid.String()),
-	))
-	defer span.End()
-
+func (v *Verifier) readEntireObject(ctx context.Context, oid object.ID, path string) (int64, error) {
 	verifierLog(ctx).Debugf("reading object %v %v", oid, path)
 
 	// read the entire file
 	r, err := v.rep.OpenObject(ctx, oid)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return errors.Wrapf(err, "unable to open object %v", oid)
+		return 0, errors.Wrapf(err, "unable to open object %v", oid)
 	}
 	defer r.Close() //nolint:errcheck
 
 	n, err := iocopy.Copy(io.Discard, r)
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		return errors.Wrap(err, "unable to read data")
+		return 0, errors.Wrap(err, "unable to read data")
 	}
-
-	span.SetAttributes(attribute.Int64("bytes_read", n))
 
 	v.statsMu.Lock()
 	defer v.statsMu.Unlock()
@@ -259,7 +251,7 @@ func (v *Verifier) readEntireObject(ctx context.Context, oid object.ID, path str
 	v.readBytes += n
 	v.readFiles++
 
-	return nil
+	return n, nil
 }
 
 // VerifierOptions provides options for the verifier.
